@@ -1,0 +1,154 @@
+export type Account = {
+  id: string;
+  email: string;
+  name: string;
+  companyName: string;
+  postalAddress: string;
+  fromName: string;
+  fromEmail: string;
+  replyTo: string;
+  smtpHost: string;
+  smtpPort: number;
+  smtpSecure: boolean;
+  smtpUser: string;
+  smtpConfigured: boolean;
+  hasSmtpPassword: boolean;
+  createdAt: string;
+};
+
+export type ContactList = {
+  id: string;
+  name: string;
+  createdAt: string;
+  contactCount: number;
+  subscribedCount: number;
+};
+
+export type Contact = {
+  id: string;
+  email: string;
+  firstName: string;
+  lastName: string;
+  status: string;
+  createdAt: string;
+  listNames: string;
+};
+
+export type Template = {
+  id: string;
+  name: string;
+  subject: string;
+  html: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type CampaignStatus = "draft" | "sending" | "paused" | "sent";
+
+export type Campaign = {
+  id: string;
+  name: string;
+  subject: string;
+  html: string;
+  listId: string | null;
+  listName: string | null;
+  fromName: string;
+  fromEmail: string;
+  replyTo: string;
+  status: CampaignStatus;
+  createdAt: string;
+  updatedAt: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+};
+
+export type CampaignStats = {
+  total: number;
+  sent: number;
+  failed: number;
+  waiting: number;
+  skipped: number;
+  uniqueOpens: number;
+  opens: number;
+  uniqueClicks: number;
+  clicks: number;
+  unsubscribes: number;
+};
+
+export type ClickStat = { url: string; hits: number };
+
+export type DeliveryView = {
+  id: string;
+  recipientId: string;
+  email: string;
+  subject: string;
+  html: string;
+  mode: string;
+  token: string;
+  status: string;
+  createdAt: string;
+};
+
+export type FailureRow = {
+  email: string;
+  error: string;
+};
+
+export type Page<T> = {
+  rows: T[];
+  total: number;
+  page: number;
+  pageSize: number;
+};
+
+export type ImportResult = {
+  created: number;
+  updated: number;
+  addedToList: number;
+  invalid: number;
+  keptUnsubscribed: number;
+};
+
+export type Dashboard = {
+  subscribed: number;
+  unsubscribed: number;
+  lists: number;
+  sentCampaigns: number;
+  sentRecipients: number;
+  uniqueOpens: number;
+  uniqueClicks: number;
+};
+
+export type SettingsInput = {
+  name: string;
+  companyName: string;
+  postalAddress: string;
+  fromName: string;
+  fromEmail: string;
+  replyTo: string;
+  smtpHost: string;
+  smtpPort: number;
+  smtpSecure: boolean;
+  smtpUser: string;
+  smtpPass: string | null;
+};
+
+export type SendJob = {
+  recipientId: string;
+  campaignId: string;
+  contactId: string | null;
+  contactStatus: string | null;
+  email: string;
+  firstName: string;
+  lastName: string;
+  unsubToken: string;
+  token: string;
+  subject: string;
+  html: string;
+  fromName: string;
+  fromEmail: string;
+  replyTo: string;
+  origin: string;
+  userId: string;
+  campaignStatus: string;
+};
