@@ -14,7 +14,7 @@ export default async function CampaignsPage({
 }) {
   const user = await requireUser();
   const params = await searchParams;
-  const campaigns = listCampaigns(user.id);
+  const campaigns = await listCampaigns(user.id);
   return (
     <div>
       <PageHeader

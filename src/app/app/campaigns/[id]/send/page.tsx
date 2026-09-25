@@ -19,10 +19,10 @@ export default async function SendCampaignPage({
   const user = await requireUser();
   const { id } = await params;
   const query = await searchParams;
-  const campaign = getCampaign(user.id, id);
+  const campaign = await getCampaign(user.id, id);
   if (!campaign) notFound();
-  const account = getAccount(user.id);
-  const subscribed = subscribedCount(user.id, campaign.listId);
+  const account = await getAccount(user.id);
+  const subscribed = await subscribedCount(user.id, campaign.listId);
   const blockers =
     campaign.status === "draft"
       ? sendBlockers({

@@ -11,12 +11,14 @@
     "build": "next build",
     "start": "next start -p 3010",
     "lint": "eslint",
-    "test": "node --import tsx --test --test-concurrency=1 src/lib/csv.test.ts src/lib/render.test.ts src/lib/queue.test.ts"
+    "test": "node --import tsx --test --test-concurrency=1 src/lib/csv.test.ts src/lib/render.test.ts src/lib/queue.test.ts src/lib/sql.test.ts"
   },
   "dependencies": {
+    "@vercel/functions": "^3.9.9",
     "bcryptjs": "^2.4.3",
     "next": "16.2.12",
     "nodemailer": "^7.0.6",
+    "postgres": "^3.4.9",
     "react": "19.2.4",
     "react-dom": "19.2.4"
   },

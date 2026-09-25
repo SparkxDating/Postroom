@@ -16,7 +16,7 @@ import { withMessage } from "../validators";
 export async function createCampaignAction(formData: FormData): Promise<void> {
   const user = await requireUser();
   try {
-    const id = saveCampaign(user.id, {
+    const id = await saveCampaign(user.id, {
       name: String(formData.get("name") || ""),
       subject: "",
       html: "",
@@ -36,7 +36,7 @@ export async function saveCampaignAction(formData: FormData): Promise<void> {
   const user = await requireUser();
   const id = String(formData.get("id") || "");
   try {
-    saveCampaign(user.id, {
+    await saveCampaign(user.id, {
       id,
       name: String(formData.get("name") || ""),
       subject: String(formData.get("subject") || ""),
@@ -59,7 +59,7 @@ export async function queueCampaignAction(formData: FormData): Promise<void> {
   const id = String(formData.get("id") || "");
   let queued = 0;
   try {
-    queued = queueCampaign(user.id, id, await requestOrigin()).queued;
+    queued = (await queueCampaign(user.id, id, await requestOrigin())).queued;
   } catch (error) {
     if (error instanceof UserError) redirect(withMessage(`/app/campaigns/${id}/send`, "error", error.message));
     throw error;
@@ -77,7 +77,7 @@ export async function pauseCampaignAction(formData: FormData): Promise<void> {
   const user = await requireUser();
   const id = String(formData.get("id") || "");
   try {
-    setCampaignStatus(user.id, id, "paused");
+    await setCampaignStatus(user.id, id, "paused");
   } catch (error) {
     if (error instanceof UserError) redirect(withMessage(`/app/campaigns/${id}`, "error", error.message));
     throw error;
@@ -89,7 +89,7 @@ export async function resumeCampaignAction(formData: FormData): Promise<void> {
   const user = await requireUser();
   const id = String(formData.get("id") || "");
   try {
-    setCampaignStatus(user.id, id, "sending");
+    await setCampaignStatus(user.id, id, "sending");
   } catch (error) {
     if (error instanceof UserError) redirect(withMessage(`/app/campaigns/${id}`, "error", error.message));
     throw error;
@@ -100,7 +100,7 @@ export async function resumeCampaignAction(formData: FormData): Promise<void> {
 export async function duplicateCampaignAction(formData: FormData): Promise<void> {
   const user = await requireUser();
   try {
-    const id = duplicateCampaign(user.id, String(formData.get("id") || ""));
+    const id = await duplicateCampaign(user.id, String(formData.get("id") || ""));
     redirect(`/app/campaigns/${id}`);
   } catch (error) {
     if (error instanceof UserError) redirect(withMessage("/app/campaigns", "error", error.message));
@@ -110,6 +110,6 @@ export async function duplicateCampaignAction(formData: FormData): Promise<void>
 
 export async function deleteCampaignAction(formData: FormData): Promise<void> {
   const user = await requireUser();
-  deleteCampaign(user.id, String(formData.get("id") || ""));
+  await deleteCampaign(user.id, String(formData.get("id") || ""));
   redirect(withMessage("/app/campaigns", "notice", "Campaign deleted."));
 }

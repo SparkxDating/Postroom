@@ -9,14 +9,14 @@ export async function currentUser(): Promise<Account | null> {
   const jar = await cookies();
   const id = jar.get(SESSION_COOKIE)?.value;
   if (!id) return null;
-  return accountForSession(id);
+  return await accountForSession(id);
 }
 
 export async function requireUser(): Promise<Account> {
   const jar = await cookies();
   const id = jar.get(SESSION_COOKIE)?.value;
   if (!id) redirect("/login");
-  const user = accountForSession(id);
+  const user = await accountForSession(id);
   if (!user) redirect("/api/clear-session");
   return user;
 }

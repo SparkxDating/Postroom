@@ -38,7 +38,7 @@ function readSettings(formData: FormData, blankPassword: "keep" | "clear"): Sett
 export async function saveSettingsAction(formData: FormData): Promise<void> {
   const user = await requireUser();
   try {
-    updateSettings(user.id, readSettings(formData, "keep"));
+    await updateSettings(user.id, readSettings(formData, "keep"));
   } catch (error) {
     if (error instanceof UserError) redirect(withMessage("/app/settings", "error", error.message));
     throw error;
@@ -52,7 +52,7 @@ export async function testSmtpAction(formData: FormData): Promise<void> {
     const input = readSettings(formData, "keep");
     if (!input.smtpHost.trim()) throw new UserError("Add an SMTP host first.");
     let pass = input.smtpPass ?? "";
-    if (!pass) pass = smtpCredentials(user.id).pass;
+    if (!pass) pass = (await smtpCredentials(user.id)).pass;
     await verifySmtp({
       host: input.smtpHost.trim(),
       port: input.smtpPort,

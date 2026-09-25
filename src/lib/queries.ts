@@ -1,8 +1,7 @@
 import bcrypt from "bcryptjs";
 import { readContactCsv, toCsv } from "./csv";
 import { decryptSecret, encryptSecret, newId, newToken } from "./crypto";
-import type { SQLInputValue } from "node:sqlite";
-import { changesOf, getDb } from "./db";
+import { readySql, type Sql } from "./sql";
 import { STARTER_TEMPLATES } from "./templates";
 import { addDaysIso, nowIso } from "./time";
 import type {
@@ -24,7 +23,23 @@ import type {
 import { UserError } from "./user-error";
 import { isEmail, normalizeEmail, sendBlockers } from "./validators";
 
+// Every query here must run on both SQLite (local) and Postgres (production):
+// - use `?` placeholders (sql.ts rewrites them for Postgres) and never a literal `?`
+// - COUNT/SUM come back as strings from Postgres (bigint), so wrap them in Number()
+// - use ON CONFLICT instead of INSERT OR IGNORE / INSERT OR REPLACE
+// - Postgres LIKE is case sensitive; compare LOWER(column) with a lowercased pattern
+
 const PAGE_SIZE = 50;
+
+function listNamesAgg(sql: Sql): string {
+  return sql.dialect === "postgres" ? "string_agg(l.name, ', ')" : "GROUP_CONCAT(l.name, ', ')";
+}
+
+/** Case-insensitive "contains" pattern, the same on SQLite and Postgres. Use with `LIKE ? ESCAPE '\'`. */
+function containsPattern(query: string): string {
+  const cleaned = query.trim().replace(/[%_]/g, "").toLowerCase().replace(/\\/g, "\\\\");
+  return `%${cleaned}%`;
+}
 
 type UserRow = {
   id: string;
@@ -58,8 +73,8 @@ function toAccount(row: UserRow): Account {
     fromEmail: row.from_email,
     replyTo: row.reply_to,
     smtpHost: row.smtp_host,
-    smtpPort: row.smtp_port,
-    smtpSecure: row.smtp_secure === 1,
+    smtpPort: Number(row.smtp_port),
+    smtpSecure: Number(row.smtp_secure) === 1,
     smtpUser: row.smtp_user,
     smtpConfigured: row.smtp_host.trim() !== "",
     hasSmtpPassword: row.smtp_pass.trim() !== "",
@@ -67,74 +82,76 @@ function toAccount(row: UserRow): Account {
   };
 }
 
-function userById(id: string): UserRow | null {
-  return (getDb().prepare(`SELECT ${USER_COLUMNS} FROM users WHERE id = ?`).get(id) as UserRow | undefined) ?? null;
+async function userById(id: string): Promise<UserRow | null> {
+  const sql = await readySql();
+  return (await sql.prepare(`SELECT ${USER_COLUMNS} FROM users WHERE id = ?`).get(id)) as UserRow | null;
 }
 
-function requireOwnedUser(id: string): UserRow {
-  const row = userById(id);
+async function requireOwnedUser(id: string): Promise<UserRow> {
+  const row = await userById(id);
   if (!row) throw new UserError("Account not found.");
   return row;
 }
 
-export function createUser(input: { name: string; email: string; password: string }): Account {
+export async function createUser(input: { name: string; email: string; password: string }): Promise<Account> {
   const email = normalizeEmail(input.email);
   const name = input.name.trim();
   if (name.length < 1 || name.length > 80) throw new UserError("Enter your name.");
   if (!isEmail(email)) throw new UserError("Enter a valid email.");
   if (input.password.length < 8) throw new UserError("Use at least 8 characters for the password.");
-  const existing = getDb().prepare("SELECT id FROM users WHERE email = ?").get(email);
+  const sql = await readySql();
+  const existing = await sql.prepare("SELECT id FROM users WHERE email = ?").get(email);
   if (existing) throw new UserError("An account with that email already exists.");
   const id = newId();
   const createdAt = nowIso();
-  const db = getDb();
-  db.exec("BEGIN IMMEDIATE");
-  try {
-    db.prepare(
-      `INSERT INTO users (id, email, password_hash, name, from_name, from_email, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    ).run(id, email, bcrypt.hashSync(input.password, 10), name, name, email, createdAt);
-    const insertTemplate = db.prepare(
+  const passwordHash = bcrypt.hashSync(input.password, 10);
+  await sql.transaction(async (tx) => {
+    await tx
+      .prepare(
+        `INSERT INTO users (id, email, password_hash, name, from_name, from_email, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(id, email, passwordHash, name, name, email, createdAt);
+    const insertTemplate = tx.prepare(
       `INSERT INTO templates (id, user_id, name, subject, html, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
     );
     for (const template of STARTER_TEMPLATES) {
-      insertTemplate.run(newId(), id, template.name, template.subject, template.html.trim(), createdAt, createdAt);
+      await insertTemplate.run(newId(), id, template.name, template.subject, template.html.trim(), createdAt, createdAt);
     }
-    db.exec("COMMIT");
-  } catch (error) {
-    db.exec("ROLLBACK");
-    throw error;
-  }
-  return toAccount(requireOwnedUser(id));
+  });
+  return toAccount(await requireOwnedUser(id));
 }
 
 let dummyHash: string | null = null;
 
-export function verifyPassword(email: string, password: string): Account | null {
-  const row = getDb().prepare(`SELECT ${USER_COLUMNS} FROM users WHERE email = ?`).get(normalizeEmail(email)) as
+export async function verifyPassword(email: string, password: string): Promise<Account | null> {
+  const sql = await readySql();
+  const row = (await sql.prepare(`SELECT ${USER_COLUMNS} FROM users WHERE email = ?`).get(normalizeEmail(email))) as
     | UserRow
-    | undefined;
+    | null;
   const hash = row?.password_hash ?? (dummyHash ??= bcrypt.hashSync("postroom-dummy-password", 10));
   const ok = bcrypt.compareSync(password, hash);
   if (!row || !ok) return null;
   return toAccount(row);
 }
 
-export function createSession(userId: string): string {
+export async function createSession(userId: string): Promise<string> {
   const id = newToken();
-  const db = getDb();
-  db.prepare("DELETE FROM sessions WHERE expires_at < ?").run(nowIso());
-  db.prepare("INSERT INTO sessions (id, user_id, expires_at) VALUES (?, ?, ?)").run(id, userId, addDaysIso(30));
+  const sql = await readySql();
+  await sql.prepare("DELETE FROM sessions WHERE expires_at < ?").run(nowIso());
+  await sql.prepare("INSERT INTO sessions (id, user_id, expires_at) VALUES (?, ?, ?)").run(id, userId, addDaysIso(30));
   return id;
 }
 
-export function deleteSession(id: string): void {
-  getDb().prepare("DELETE FROM sessions WHERE id = ?").run(id);
+export async function deleteSession(id: string): Promise<void> {
+  const sql = await readySql();
+  await sql.prepare("DELETE FROM sessions WHERE id = ?").run(id);
 }
 
-export function accountForSession(sessionId: string): Account | null {
-  const row = getDb()
+export async function accountForSession(sessionId: string): Promise<Account | null> {
+  const sql = await readySql();
+  const row = (await sql
     .prepare(
       `SELECT ${USER_COLUMNS.split(",")
         .map((column) => `u.${column.trim()}`)
@@ -142,14 +159,15 @@ export function accountForSession(sessionId: string): Account | null {
        FROM sessions s JOIN users u ON u.id = s.user_id
        WHERE s.id = ? AND s.expires_at > ?`,
     )
-    .get(sessionId, nowIso()) as UserRow | undefined;
+    .get(sessionId, nowIso())) as UserRow | null;
   return row ? toAccount(row) : null;
 }
 
-export function updateSettings(userId: string, input: SettingsInput): void {
-  const current = requireOwnedUser(userId);
+export async function updateSettings(userId: string, input: SettingsInput): Promise<void> {
+  const current = await requireOwnedUser(userId);
   const smtpPass = input.smtpPass === null ? current.smtp_pass : encryptSecret(input.smtpPass);
-  getDb()
+  const sql = await readySql();
+  await sql
     .prepare(
       `UPDATE users SET name = ?, company_name = ?, postal_address = ?, from_name = ?, from_email = ?, reply_to = ?,
         smtp_host = ?, smtp_port = ?, smtp_secure = ?, smtp_user = ?, smtp_pass = ? WHERE id = ?`,
@@ -170,25 +188,26 @@ export function updateSettings(userId: string, input: SettingsInput): void {
     );
 }
 
-export function getAccount(userId: string): Account {
-  return toAccount(requireOwnedUser(userId));
+export async function getAccount(userId: string): Promise<Account> {
+  return toAccount(await requireOwnedUser(userId));
 }
 
-export function campaignIsSending(campaignId: string): boolean {
-  const row = getDb().prepare("SELECT status FROM campaigns WHERE id = ?").get(campaignId) as
+export async function campaignIsSending(campaignId: string): Promise<boolean> {
+  const sql = await readySql();
+  const row = (await sql.prepare("SELECT status FROM campaigns WHERE id = ?").get(campaignId)) as
     | { status: string }
-    | undefined;
+    | null;
   return row?.status === "sending";
 }
 
-export function smtpCredentials(userId: string): {
+export async function smtpCredentials(userId: string): Promise<{
   host: string;
   port: number;
   secure: boolean;
   user: string;
   pass: string;
-} {
-  const row = requireOwnedUser(userId);
+}> {
+  const row = await requireOwnedUser(userId);
   let pass = "";
   try {
     pass = decryptSecret(row.smtp_pass);
@@ -197,32 +216,35 @@ export function smtpCredentials(userId: string): {
   }
   return {
     host: row.smtp_host.trim(),
-    port: row.smtp_port,
-    secure: row.smtp_secure === 1,
+    port: Number(row.smtp_port),
+    secure: Number(row.smtp_secure) === 1,
     user: row.smtp_user,
     pass,
   };
 }
 
-export function deleteAccount(userId: string): void {
-  getDb().prepare("DELETE FROM users WHERE id = ?").run(userId);
+export async function deleteAccount(userId: string): Promise<void> {
+  const sql = await readySql();
+  await sql.prepare("DELETE FROM users WHERE id = ?").run(userId);
 }
 
-export function dashboard(userId: string): Dashboard {
-  const db = getDb();
-  const contacts = db
+type CountRow = { n: number | string };
+
+export async function dashboard(userId: string): Promise<Dashboard> {
+  const sql = await readySql();
+  const contacts = (await sql
     .prepare(
       `SELECT
          SUM(CASE WHEN status = 'subscribed' THEN 1 ELSE 0 END) AS subscribed,
          SUM(CASE WHEN status = 'unsubscribed' THEN 1 ELSE 0 END) AS unsubscribed
        FROM contacts WHERE user_id = ?`,
     )
-    .get(userId) as { subscribed: number | null; unsubscribed: number | null };
-  const lists = db.prepare("SELECT COUNT(*) AS n FROM lists WHERE user_id = ?").get(userId) as { n: number };
-  const campaigns = db
+    .get(userId)) as { subscribed: number | string | null; unsubscribed: number | string | null };
+  const lists = (await sql.prepare("SELECT COUNT(*) AS n FROM lists WHERE user_id = ?").get(userId)) as CountRow;
+  const campaigns = (await sql
     .prepare("SELECT COUNT(*) AS n FROM campaigns WHERE user_id = ? AND status = 'sent'")
-    .get(userId) as { n: number };
-  const mail = db
+    .get(userId)) as CountRow;
+  const mail = (await sql
     .prepare(
       `SELECT
          SUM(CASE WHEN r.status = 'sent' THEN 1 ELSE 0 END) AS sent,
@@ -231,7 +253,7 @@ export function dashboard(userId: string): Dashboard {
        FROM recipients r JOIN campaigns c ON c.id = r.campaign_id
        WHERE c.user_id = ?`,
     )
-    .get(userId) as { sent: number | null; opens: number | null; clicks: number | null };
+    .get(userId)) as { sent: number | string | null; opens: number | string | null; clicks: number | string | null };
   return {
     subscribed: Number(contacts.subscribed ?? 0),
     unsubscribed: Number(contacts.unsubscribed ?? 0),
@@ -243,20 +265,22 @@ export function dashboard(userId: string): Dashboard {
   };
 }
 
-export function recentCampaigns(userId: string): Campaign[] {
-  return getDb()
+export async function recentCampaigns(userId: string): Promise<Campaign[]> {
+  const sql = await readySql();
+  const rows = await sql
     .prepare(
       `SELECT c.id, c.name, c.subject, c.html, c.list_id, l.name AS list_name, c.from_name, c.from_email, c.reply_to,
               c.status, c.created_at, c.updated_at, c.started_at, c.finished_at
        FROM campaigns c LEFT JOIN lists l ON l.id = c.list_id
        WHERE c.user_id = ? ORDER BY c.updated_at DESC LIMIT 6`,
     )
-    .all(userId)
-    .map((row) => mapCampaign(row as Record<string, unknown>));
+    .all(userId);
+  return rows.map((row) => mapCampaign(row as Record<string, unknown>));
 }
 
-export function listLists(userId: string): ContactList[] {
-  return getDb()
+export async function listLists(userId: string): Promise<ContactList[]> {
+  const sql = await readySql();
+  const rows = await sql
     .prepare(
       `SELECT l.id, l.name, l.created_at,
               COUNT(lc.contact_id) AS contact_count,
@@ -265,61 +289,65 @@ export function listLists(userId: string): ContactList[] {
        LEFT JOIN list_contacts lc ON lc.list_id = l.id
        LEFT JOIN contacts c ON c.id = lc.contact_id
        WHERE l.user_id = ?
-       GROUP BY l.id
+       GROUP BY l.id, l.name, l.created_at
        ORDER BY l.created_at DESC`,
     )
-    .all(userId)
-    .map((row) => {
-      const item = row as {
-        id: string;
-        name: string;
-        created_at: string;
-        contact_count: number;
-        subscribed_count: number | null;
-      };
-      return {
-        id: item.id,
-        name: item.name,
-        createdAt: item.created_at,
-        contactCount: Number(item.contact_count),
-        subscribedCount: Number(item.subscribed_count ?? 0),
-      };
-    });
+    .all(userId);
+  return rows.map((row) => {
+    const item = row as {
+      id: string;
+      name: string;
+      created_at: string;
+      contact_count: number | string;
+      subscribed_count: number | string | null;
+    };
+    return {
+      id: item.id,
+      name: item.name,
+      createdAt: item.created_at,
+      contactCount: Number(item.contact_count),
+      subscribedCount: Number(item.subscribed_count ?? 0),
+    };
+  });
 }
 
-export function createList(userId: string, name: string): string {
+export async function createList(userId: string, name: string): Promise<string> {
   const trimmed = name.trim();
   if (trimmed.length < 1 || trimmed.length > 80) throw new UserError("Give the list a name.");
   const id = newId();
-  getDb().prepare("INSERT INTO lists (id, user_id, name, created_at) VALUES (?, ?, ?, ?)").run(id, userId, trimmed, nowIso());
+  const sql = await readySql();
+  await sql.prepare("INSERT INTO lists (id, user_id, name, created_at) VALUES (?, ?, ?, ?)").run(id, userId, trimmed, nowIso());
   return id;
 }
 
-export function renameList(userId: string, listId: string, name: string): void {
+export async function renameList(userId: string, listId: string, name: string): Promise<void> {
   const trimmed = name.trim();
   if (trimmed.length < 1 || trimmed.length > 80) throw new UserError("Give the list a name.");
-  const result = getDb().prepare("UPDATE lists SET name = ? WHERE id = ? AND user_id = ?").run(trimmed, listId, userId);
-  if (changesOf(result) === 0) throw new UserError("List not found.");
+  const sql = await readySql();
+  const changed = await sql.prepare("UPDATE lists SET name = ? WHERE id = ? AND user_id = ?").run(trimmed, listId, userId);
+  if (changed === 0) throw new UserError("List not found.");
 }
 
-export function getList(userId: string, listId: string): ContactList | null {
-  return listLists(userId).find((list) => list.id === listId) ?? null;
+export async function getList(userId: string, listId: string): Promise<ContactList | null> {
+  return (await listLists(userId)).find((list) => list.id === listId) ?? null;
 }
 
-export function deleteList(userId: string, listId: string): void {
-  getDb().prepare("DELETE FROM lists WHERE id = ? AND user_id = ?").run(listId, userId);
+export async function deleteList(userId: string, listId: string): Promise<void> {
+  const sql = await readySql();
+  await sql.prepare("DELETE FROM lists WHERE id = ? AND user_id = ?").run(listId, userId);
 }
 
-function pageOf<T>(sql: string, countSql: string, params: SQLInputValue[], page: number): Page<T> {
+async function pageOf<T>(query: string, countQuery: string, params: unknown[], page: number): Promise<Page<T>> {
   const safePage = Number.isFinite(page) && page > 0 ? Math.floor(page) : 1;
-  const total = Number((getDb().prepare(countSql).get(...params) as { n: number }).n);
-  const rows = getDb()
-    .prepare(`${sql} LIMIT ? OFFSET ?`)
-    .all(...params, PAGE_SIZE, (safePage - 1) * PAGE_SIZE) as T[];
+  const sql = await readySql();
+  const total = Number(((await sql.prepare(countQuery).get(...params)) as CountRow).n);
+  const rows = (await sql
+    .prepare(`${query} LIMIT ? OFFSET ?`)
+    .all(...params, PAGE_SIZE, (safePage - 1) * PAGE_SIZE)) as T[];
   return { rows, total, page: safePage, pageSize: PAGE_SIZE };
 }
 
-function mapContact(row: {
+type ContactRow = {
   id: string;
   email: string;
   first_name: string;
@@ -327,7 +355,9 @@ function mapContact(row: {
   status: string;
   created_at: string;
   list_names: string | null;
-}): Contact {
+};
+
+function mapContact(row: ContactRow): Contact {
   return {
     id: row.id,
     email: row.email,
@@ -339,21 +369,17 @@ function mapContact(row: {
   };
 }
 
-export function listContacts(userId: string, page: number, query: string): Page<Contact> {
-  const like = `%${query.trim().replace(/[%_]/g, "")}%`;
-  const where = `FROM contacts c WHERE c.user_id = ? AND (? = '%%' OR c.email LIKE ? OR c.first_name LIKE ? OR c.last_name LIKE ?)`;
+const CONTACT_SEARCH = `(? = '%%' OR LOWER(c.email) LIKE ? ESCAPE '\\' OR LOWER(c.first_name) LIKE ? ESCAPE '\\'
+  OR LOWER(c.last_name) LIKE ? ESCAPE '\\')`;
+
+export async function listContacts(userId: string, page: number, query: string): Promise<Page<Contact>> {
+  const sql = await readySql();
+  const like = containsPattern(query);
+  const where = `FROM contacts c WHERE c.user_id = ? AND ${CONTACT_SEARCH}`;
   const params = [userId, like, like, like, like];
-  const result = pageOf<{
-    id: string;
-    email: string;
-    first_name: string;
-    last_name: string;
-    status: string;
-    created_at: string;
-    list_names: string | null;
-  }>(
+  const result = await pageOf<ContactRow>(
     `SELECT c.id, c.email, c.first_name, c.last_name, c.status, c.created_at,
-            (SELECT GROUP_CONCAT(l.name, ', ') FROM list_contacts lc JOIN lists l ON l.id = lc.list_id WHERE lc.contact_id = c.id) AS list_names
+            (SELECT ${listNamesAgg(sql)} FROM list_contacts lc JOIN lists l ON l.id = lc.list_id WHERE lc.contact_id = c.id) AS list_names
      ${where} ORDER BY c.created_at DESC`,
     `SELECT COUNT(*) AS n ${where}`,
     params,
@@ -362,22 +388,14 @@ export function listContacts(userId: string, page: number, query: string): Page<
   return { ...result, rows: result.rows.map(mapContact) };
 }
 
-export function listMembers(userId: string, listId: string, page: number, query: string): Page<Contact> | null {
-  if (!getList(userId, listId)) return null;
-  const like = `%${query.trim().replace(/[%_]/g, "")}%`;
+export async function listMembers(userId: string, listId: string, page: number, query: string): Promise<Page<Contact> | null> {
+  if (!(await getList(userId, listId))) return null;
+  const like = containsPattern(query);
   const where = `FROM contacts c
     JOIN list_contacts lc ON lc.contact_id = c.id AND lc.list_id = ?
-    WHERE c.user_id = ? AND (? = '%%' OR c.email LIKE ? OR c.first_name LIKE ? OR c.last_name LIKE ?)`;
+    WHERE c.user_id = ? AND ${CONTACT_SEARCH}`;
   const params = [listId, userId, like, like, like, like];
-  const result = pageOf<{
-    id: string;
-    email: string;
-    first_name: string;
-    last_name: string;
-    status: string;
-    created_at: string;
-    list_names: string | null;
-  }>(
+  const result = await pageOf<ContactRow>(
     `SELECT c.id, c.email, c.first_name, c.last_name, c.status, c.created_at, '' AS list_names
      ${where} ORDER BY c.email`,
     `SELECT COUNT(*) AS n ${where}`,
@@ -387,136 +405,125 @@ export function listMembers(userId: string, listId: string, page: number, query:
   return { ...result, rows: result.rows.map(mapContact) };
 }
 
-export function addContact(
+const INSERT_CONTACT = `INSERT INTO contacts (id, user_id, email, first_name, last_name, status, unsub_token, created_at)
+  VALUES (?, ?, ?, ?, ?, 'subscribed', ?, ?)`;
+
+const UPDATE_CONTACT_NAMES = `UPDATE contacts SET
+  first_name = CASE WHEN ? != '' THEN ? ELSE first_name END,
+  last_name = CASE WHEN ? != '' THEN ? ELSE last_name END
+  WHERE id = ?`;
+
+const LINK_CONTACT = `INSERT INTO list_contacts (list_id, contact_id, created_at) VALUES (?, ?, ?)
+  ON CONFLICT (list_id, contact_id) DO NOTHING`;
+
+export async function addContact(
   userId: string,
   input: { email: string; firstName: string; lastName: string; listId?: string | null },
-): { created: boolean; status: string } {
+): Promise<{ created: boolean; status: string }> {
   const email = normalizeEmail(input.email);
   if (!isEmail(email)) throw new UserError("Enter a valid email.");
-  if (input.listId && !getList(userId, input.listId)) throw new UserError("List not found.");
-  const db = getDb();
-  const existing = db
+  if (input.listId && !(await getList(userId, input.listId))) throw new UserError("List not found.");
+  const sql = await readySql();
+  const existing = (await sql
     .prepare("SELECT id, status FROM contacts WHERE user_id = ? AND email = ?")
-    .get(userId, email) as { id: string; status: string } | undefined;
+    .get(userId, email)) as { id: string; status: string } | null;
   const now = nowIso();
   let id = existing?.id;
   let created = false;
   if (!existing) {
     id = newId();
     created = true;
-    db.prepare(
-      `INSERT INTO contacts (id, user_id, email, first_name, last_name, status, unsub_token, created_at)
-       VALUES (?, ?, ?, ?, ?, 'subscribed', ?, ?)`,
-    ).run(id, userId, email, input.firstName.trim().slice(0, 80), input.lastName.trim().slice(0, 80), newToken(), now);
+    await sql
+      .prepare(INSERT_CONTACT)
+      .run(id, userId, email, input.firstName.trim().slice(0, 80), input.lastName.trim().slice(0, 80), newToken(), now);
   } else {
-    db.prepare(
-      `UPDATE contacts SET
-         first_name = CASE WHEN ? != '' THEN ? ELSE first_name END,
-         last_name = CASE WHEN ? != '' THEN ? ELSE last_name END
-       WHERE id = ?`,
-    ).run(
-      input.firstName.trim(),
-      input.firstName.trim().slice(0, 80),
-      input.lastName.trim(),
-      input.lastName.trim().slice(0, 80),
-      existing.id,
-    );
+    await sql
+      .prepare(UPDATE_CONTACT_NAMES)
+      .run(
+        input.firstName.trim(),
+        input.firstName.trim().slice(0, 80),
+        input.lastName.trim(),
+        input.lastName.trim().slice(0, 80),
+        existing.id,
+      );
   }
   if (input.listId && id) {
-    db.prepare("INSERT OR IGNORE INTO list_contacts (list_id, contact_id, created_at) VALUES (?, ?, ?)").run(
-      input.listId,
-      id,
-      now,
-    );
+    await sql.prepare(LINK_CONTACT).run(input.listId, id, now);
   }
   const status = existing?.status ?? "subscribed";
   return { created, status };
 }
 
-export function setContactStatus(userId: string, contactId: string, status: "subscribed" | "unsubscribed"): void {
-  const result = getDb()
+export async function setContactStatus(userId: string, contactId: string, status: "subscribed" | "unsubscribed"): Promise<void> {
+  const sql = await readySql();
+  const changed = await sql
     .prepare("UPDATE contacts SET status = ? WHERE id = ? AND user_id = ?")
     .run(status, contactId, userId);
-  if (changesOf(result) === 0) throw new UserError("Contact not found.");
+  if (changed === 0) throw new UserError("Contact not found.");
 }
 
-export function deleteContact(userId: string, contactId: string): void {
-  const db = getDb();
-  const row = db
+export async function deleteContact(userId: string, contactId: string): Promise<void> {
+  const sql = await readySql();
+  const row = (await sql
     .prepare("SELECT id, email, unsub_token FROM contacts WHERE id = ? AND user_id = ?")
-    .get(contactId, userId) as { id: string; email: string; unsub_token: string } | undefined;
+    .get(contactId, userId)) as { id: string; email: string; unsub_token: string } | null;
   if (!row) throw new UserError("Contact not found.");
   const now = nowIso();
-  db.exec("BEGIN IMMEDIATE");
-  try {
-    db.prepare(
-      "INSERT OR REPLACE INTO suppressions (token, user_id, email, created_at) VALUES (?, ?, ?, ?)",
-    ).run(row.unsub_token, userId, row.email, now);
-    db.prepare(
-      `UPDATE recipients SET status = 'skipped', error = 'Contact removed', claimed_at = NULL
-       WHERE contact_id = ? AND status IN ('pending', 'sending')`,
-    ).run(row.id);
-    db.prepare("DELETE FROM contacts WHERE id = ?").run(row.id);
-    db.exec("COMMIT");
-  } catch (error) {
-    db.exec("ROLLBACK");
-    throw error;
-  }
+  await sql.transaction(async (tx) => {
+    await tx
+      .prepare(
+        `INSERT INTO suppressions (token, user_id, email, created_at) VALUES (?, ?, ?, ?)
+         ON CONFLICT (token) DO UPDATE SET user_id = excluded.user_id, email = excluded.email, created_at = excluded.created_at`,
+      )
+      .run(row.unsub_token, userId, row.email, now);
+    await tx
+      .prepare(
+        `UPDATE recipients SET status = 'skipped', error = 'Contact removed', claimed_at = NULL
+         WHERE contact_id = ? AND status IN ('pending', 'sending')`,
+      )
+      .run(row.id);
+    await tx.prepare("DELETE FROM contacts WHERE id = ?").run(row.id);
+  });
 }
 
-export function removeFromList(userId: string, listId: string, contactId: string): void {
-  if (!getList(userId, listId)) throw new UserError("List not found.");
-  getDb().prepare("DELETE FROM list_contacts WHERE list_id = ? AND contact_id = ?").run(listId, contactId);
+export async function removeFromList(userId: string, listId: string, contactId: string): Promise<void> {
+  if (!(await getList(userId, listId))) throw new UserError("List not found.");
+  const sql = await readySql();
+  await sql.prepare("DELETE FROM list_contacts WHERE list_id = ? AND contact_id = ?").run(listId, contactId);
 }
 
-export function importContacts(userId: string, listId: string | null, csv: string): ImportResult {
-  if (listId && !getList(userId, listId)) throw new UserError("List not found.");
+export async function importContacts(userId: string, listId: string | null, csv: string): Promise<ImportResult> {
+  if (listId && !(await getList(userId, listId))) throw new UserError("List not found.");
   const parsed = readContactCsv(csv);
-  const db = getDb();
+  const sql = await readySql();
   const now = nowIso();
   let created = 0;
   let updated = 0;
   let addedToList = 0;
   let keptUnsubscribed = 0;
-  const find = db.prepare("SELECT id, status FROM contacts WHERE user_id = ? AND email = ?");
-  const insert = db.prepare(
-    `INSERT INTO contacts (id, user_id, email, first_name, last_name, status, unsub_token, created_at)
-     VALUES (?, ?, ?, ?, ?, 'subscribed', ?, ?)`,
-  );
-  const update = db.prepare(
-    `UPDATE contacts SET
-       first_name = CASE WHEN ? != '' THEN ? ELSE first_name END,
-       last_name = CASE WHEN ? != '' THEN ? ELSE last_name END
-     WHERE id = ?`,
-  );
-  const link = db.prepare(
-    "INSERT OR IGNORE INTO list_contacts (list_id, contact_id, created_at) VALUES (?, ?, ?)",
-  );
-  db.exec("BEGIN IMMEDIATE");
-  try {
+  await sql.transaction(async (tx) => {
+    const find = tx.prepare("SELECT id, status FROM contacts WHERE user_id = ? AND email = ?");
+    const insert = tx.prepare(INSERT_CONTACT);
+    const update = tx.prepare(UPDATE_CONTACT_NAMES);
+    const link = tx.prepare(LINK_CONTACT);
     for (const contact of parsed.contacts) {
-      const existing = find.get(userId, contact.email) as { id: string; status: string } | undefined;
+      const existing = (await find.get(userId, contact.email)) as { id: string; status: string } | null;
       let id: string;
       if (!existing) {
         id = newId();
-        insert.run(id, userId, contact.email, contact.firstName, contact.lastName, newToken(), now);
+        await insert.run(id, userId, contact.email, contact.firstName, contact.lastName, newToken(), now);
         created += 1;
       } else {
         id = existing.id;
-        update.run(contact.firstName, contact.firstName, contact.lastName, contact.lastName, id);
+        await update.run(contact.firstName, contact.firstName, contact.lastName, contact.lastName, id);
         updated += 1;
         if (existing.status === "unsubscribed") keptUnsubscribed += 1;
       }
       if (listId) {
-        const linked = link.run(listId, id, now);
-        addedToList += changesOf(linked);
+        addedToList += await link.run(listId, id, now);
       }
     }
-    db.exec("COMMIT");
-  } catch (error) {
-    db.exec("ROLLBACK");
-    throw error;
-  }
+  });
   return {
     created,
     updated,
@@ -526,43 +533,40 @@ export function importContacts(userId: string, listId: string | null, csv: strin
   };
 }
 
-export function contactsCsv(userId: string, listId: string | null): string | null {
-  if (listId && !getList(userId, listId)) return null;
-  const rows = (
-    listId
-      ? getDb()
-          .prepare(
-            `SELECT c.email, c.first_name, c.last_name, c.status
-             FROM contacts c JOIN list_contacts lc ON lc.contact_id = c.id
-             WHERE lc.list_id = ? AND c.user_id = ? ORDER BY c.email`,
-          )
-          .all(listId, userId)
-      : getDb()
-          .prepare(
-            "SELECT email, first_name, last_name, status FROM contacts WHERE user_id = ? ORDER BY email",
-          )
-          .all(userId)
-  ) as { email: string; first_name: string; last_name: string; status: string }[];
+export async function contactsCsv(userId: string, listId: string | null): Promise<string | null> {
+  if (listId && !(await getList(userId, listId))) return null;
+  const sql = await readySql();
+  const rows = (await (listId
+    ? sql
+        .prepare(
+          `SELECT c.email, c.first_name, c.last_name, c.status
+           FROM contacts c JOIN list_contacts lc ON lc.contact_id = c.id
+           WHERE lc.list_id = ? AND c.user_id = ? ORDER BY c.email`,
+        )
+        .all(listId, userId)
+    : sql
+        .prepare("SELECT email, first_name, last_name, status FROM contacts WHERE user_id = ? ORDER BY email")
+        .all(userId))) as { email: string; first_name: string; last_name: string; status: string }[];
   return toCsv([
     ["email", "first_name", "last_name", "status"],
     ...rows.map((row) => [row.email, row.first_name, row.last_name, row.status]),
   ]);
 }
 
-export function listTemplates(userId: string): Template[] {
-  return getDb()
+export async function listTemplates(userId: string): Promise<Template[]> {
+  const sql = await readySql();
+  const rows = await sql
     .prepare(
       "SELECT id, name, subject, html, created_at, updated_at FROM templates WHERE user_id = ? ORDER BY updated_at DESC",
     )
-    .all(userId)
-    .map((row) => mapTemplate(row as Record<string, unknown>));
+    .all(userId);
+  return rows.map((row) => mapTemplate(row as Record<string, unknown>));
 }
 
-export function getTemplate(userId: string, id: string): Template | null {
-  const row = getDb()
-    .prepare(
-      "SELECT id, name, subject, html, created_at, updated_at FROM templates WHERE id = ? AND user_id = ?",
-    )
+export async function getTemplate(userId: string, id: string): Promise<Template | null> {
+  const sql = await readySql();
+  const row = await sql
+    .prepare("SELECT id, name, subject, html, created_at, updated_at FROM templates WHERE id = ? AND user_id = ?")
     .get(id, userId);
   return row ? mapTemplate(row as Record<string, unknown>) : null;
 }
@@ -578,10 +582,10 @@ function mapTemplate(row: Record<string, unknown>): Template {
   };
 }
 
-export function saveTemplate(
+export async function saveTemplate(
   userId: string,
   input: { id?: string; name: string; subject: string; html: string },
-): string {
+): Promise<string> {
   const name = input.name.trim();
   const subject = input.subject.trim();
   const html = input.html.trim();
@@ -589,24 +593,24 @@ export function saveTemplate(
   if (!subject || subject.length > 180) throw new UserError("Add a subject under 180 characters.");
   if (!html || html.length > 300_000) throw new UserError("Add the template body.");
   const now = nowIso();
+  const sql = await readySql();
   if (input.id) {
-    const result = getDb()
+    const changed = await sql
       .prepare("UPDATE templates SET name = ?, subject = ?, html = ?, updated_at = ? WHERE id = ? AND user_id = ?")
       .run(name, subject, html, now, input.id, userId);
-    if (changesOf(result) === 0) throw new UserError("Template not found.");
+    if (changed === 0) throw new UserError("Template not found.");
     return input.id;
   }
   const id = newId();
-  getDb()
-    .prepare(
-      "INSERT INTO templates (id, user_id, name, subject, html, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-    )
+  await sql
+    .prepare("INSERT INTO templates (id, user_id, name, subject, html, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
     .run(id, userId, name, subject, html, now, now);
   return id;
 }
 
-export function deleteTemplate(userId: string, id: string): void {
-  getDb().prepare("DELETE FROM templates WHERE id = ? AND user_id = ?").run(id, userId);
+export async function deleteTemplate(userId: string, id: string): Promise<void> {
+  const sql = await readySql();
+  await sql.prepare("DELETE FROM templates WHERE id = ? AND user_id = ?").run(id, userId);
 }
 
 function mapCampaign(row: Record<string, unknown>): Campaign {
@@ -632,19 +636,19 @@ const CAMPAIGN_SELECT = `SELECT c.id, c.name, c.subject, c.html, c.list_id, l.na
   c.reply_to, c.status, c.created_at, c.updated_at, c.started_at, c.finished_at
   FROM campaigns c LEFT JOIN lists l ON l.id = c.list_id`;
 
-export function listCampaigns(userId: string): Campaign[] {
-  return getDb()
-    .prepare(`${CAMPAIGN_SELECT} WHERE c.user_id = ? ORDER BY c.updated_at DESC`)
-    .all(userId)
-    .map((row) => mapCampaign(row as Record<string, unknown>));
+export async function listCampaigns(userId: string): Promise<Campaign[]> {
+  const sql = await readySql();
+  const rows = await sql.prepare(`${CAMPAIGN_SELECT} WHERE c.user_id = ? ORDER BY c.updated_at DESC`).all(userId);
+  return rows.map((row) => mapCampaign(row as Record<string, unknown>));
 }
 
-export function getCampaign(userId: string, id: string): Campaign | null {
-  const row = getDb().prepare(`${CAMPAIGN_SELECT} WHERE c.id = ? AND c.user_id = ?`).get(id, userId);
-  return row ? mapCampaign(row as Parameters<typeof mapCampaign>[0]) : null;
+export async function getCampaign(userId: string, id: string): Promise<Campaign | null> {
+  const sql = await readySql();
+  const row = await sql.prepare(`${CAMPAIGN_SELECT} WHERE c.id = ? AND c.user_id = ?`).get(id, userId);
+  return row ? mapCampaign(row as Record<string, unknown>) : null;
 }
 
-export function saveCampaign(
+export async function saveCampaign(
   userId: string,
   input: {
     id?: string;
@@ -656,21 +660,22 @@ export function saveCampaign(
     fromEmail: string;
     replyTo: string;
   },
-): string {
+): Promise<string> {
   const name = input.name.trim() || "Untitled campaign";
   if (name.length > 120) throw new UserError("Campaign name is too long.");
   if (input.subject.trim().length > 180) throw new UserError("Subject is too long.");
   if (input.html.length > 300_000) throw new UserError("The email body is too long.");
-  const account = toAccount(requireOwnedUser(userId));
+  const account = toAccount(await requireOwnedUser(userId));
   const fromEmail = normalizeEmail(input.fromEmail || account.fromEmail || account.email);
   if (fromEmail && !isEmail(fromEmail)) throw new UserError("From email is not valid.");
   const replyTo = input.replyTo.trim() ? normalizeEmail(input.replyTo) : "";
   if (replyTo && !isEmail(replyTo)) throw new UserError("Reply-to email is not valid.");
-  if (input.listId && !getList(userId, input.listId)) throw new UserError("List not found.");
+  if (input.listId && !(await getList(userId, input.listId))) throw new UserError("List not found.");
   const now = nowIso();
+  const sql = await readySql();
   if (!input.id) {
     const id = newId();
-    getDb()
+    await sql
       .prepare(
         `INSERT INTO campaigns (id, user_id, list_id, name, subject, html, from_name, from_email, reply_to, status, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?)`,
@@ -690,7 +695,7 @@ export function saveCampaign(
       );
     return id;
   }
-  const result = getDb()
+  const changed = await sql
     .prepare(
       `UPDATE campaigns SET list_id = ?, name = ?, subject = ?, html = ?, from_name = ?, from_email = ?, reply_to = ?, updated_at = ?
        WHERE id = ? AND user_id = ? AND status = 'draft'`,
@@ -707,12 +712,12 @@ export function saveCampaign(
       input.id,
       userId,
     );
-  if (changesOf(result) === 0) throw new UserError("Only drafts can be edited.");
+  if (changed === 0) throw new UserError("Only drafts can be edited.");
   return input.id;
 }
 
-export function duplicateCampaign(userId: string, campaignId: string): string {
-  const campaign = getCampaign(userId, campaignId);
+export async function duplicateCampaign(userId: string, campaignId: string): Promise<string> {
+  const campaign = await getCampaign(userId, campaignId);
   if (!campaign) throw new UserError("Campaign not found.");
   return saveCampaign(userId, {
     name: `${campaign.name} copy`.slice(0, 120),
@@ -725,29 +730,31 @@ export function duplicateCampaign(userId: string, campaignId: string): string {
   });
 }
 
-export function deleteCampaign(userId: string, campaignId: string): void {
-  getDb().prepare("DELETE FROM campaigns WHERE id = ? AND user_id = ?").run(campaignId, userId);
+export async function deleteCampaign(userId: string, campaignId: string): Promise<void> {
+  const sql = await readySql();
+  await sql.prepare("DELETE FROM campaigns WHERE id = ? AND user_id = ?").run(campaignId, userId);
 }
 
-export function subscribedCount(userId: string, listId: string | null): number {
+export async function subscribedCount(userId: string, listId: string | null): Promise<number> {
   if (!listId) return 0;
-  const row = getDb()
+  const sql = await readySql();
+  const row = (await sql
     .prepare(
       `SELECT COUNT(*) AS n FROM list_contacts lc
        JOIN contacts c ON c.id = lc.contact_id
        JOIN lists l ON l.id = lc.list_id
        WHERE lc.list_id = ? AND l.user_id = ? AND c.status = 'subscribed'`,
     )
-    .get(listId, userId) as { n: number };
+    .get(listId, userId)) as CountRow;
   return Number(row.n);
 }
 
-export function queueCampaign(userId: string, campaignId: string, origin: string): { queued: number } {
-  const campaign = getCampaign(userId, campaignId);
+export async function queueCampaign(userId: string, campaignId: string, origin: string): Promise<{ queued: number }> {
+  const campaign = await getCampaign(userId, campaignId);
   if (!campaign) throw new UserError("Campaign not found.");
   if (campaign.status !== "draft") throw new UserError("This campaign has already been queued.");
-  const account = toAccount(requireOwnedUser(userId));
-  const subscribed = subscribedCount(userId, campaign.listId);
+  const account = toAccount(await requireOwnedUser(userId));
+  const subscribed = await subscribedCount(userId, campaign.listId);
   const blockers = sendBlockers({
     subject: campaign.subject,
     html: campaign.html,
@@ -761,15 +768,15 @@ export function queueCampaign(userId: string, campaignId: string, origin: string
   if (blockers.length) throw new UserError(blockers[0]);
   if (!campaign.listId) throw new UserError("Choose a list.");
   const listId = campaign.listId;
-  const db = getDb();
-  const people = db
+  const sql = await readySql();
+  const people = (await sql
     .prepare(
       `SELECT c.id, c.email, c.first_name, c.last_name, c.unsub_token
        FROM contacts c
        JOIN list_contacts lc ON lc.contact_id = c.id
        WHERE lc.list_id = ? AND c.user_id = ? AND c.status = 'subscribed'`,
     )
-    .all(listId, userId) as {
+    .all(listId, userId)) as {
     id: string;
     email: string;
     first_name: string;
@@ -778,37 +785,36 @@ export function queueCampaign(userId: string, campaignId: string, origin: string
   }[];
   if (people.length === 0) throw new UserError("This list has no subscribed contacts.");
   const now = nowIso();
-  const insert = db.prepare(
-    `INSERT INTO recipients (id, campaign_id, contact_id, email, first_name, last_name, unsub_token, token, status, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
-  );
-  db.exec("BEGIN IMMEDIATE");
-  try {
-    const locked = db
-      .prepare("UPDATE campaigns SET status = 'sending', origin = ?, started_at = ?, updated_at = ? WHERE id = ? AND user_id = ? AND status = 'draft'")
+  await sql.transaction(async (tx) => {
+    const locked = await tx
+      .prepare(
+        "UPDATE campaigns SET status = 'sending', origin = ?, started_at = ?, updated_at = ? WHERE id = ? AND user_id = ? AND status = 'draft'",
+      )
       .run(origin.replace(/\/$/, ""), now, now, campaignId, userId);
-    if (changesOf(locked) === 0) throw new UserError("This campaign has already been queued.");
+    if (locked === 0) throw new UserError("This campaign has already been queued.");
+    const insert = tx.prepare(
+      `INSERT INTO recipients (id, campaign_id, contact_id, email, first_name, last_name, unsub_token, token, status, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
+    );
     for (const person of people) {
-      insert.run(newId(), campaignId, person.id, person.email, person.first_name, person.last_name, person.unsub_token, newToken(), now);
+      await insert.run(newId(), campaignId, person.id, person.email, person.first_name, person.last_name, person.unsub_token, newToken(), now);
     }
-    db.exec("COMMIT");
-  } catch (error) {
-    db.exec("ROLLBACK");
-    throw error;
-  }
+  });
   return { queued: people.length };
 }
 
-export function setCampaignStatus(userId: string, campaignId: string, status: "paused" | "sending"): void {
+export async function setCampaignStatus(userId: string, campaignId: string, status: "paused" | "sending"): Promise<void> {
   const expected = status === "paused" ? "sending" : "paused";
-  const result = getDb()
+  const sql = await readySql();
+  const changed = await sql
     .prepare("UPDATE campaigns SET status = ?, updated_at = ? WHERE id = ? AND user_id = ? AND status = ?")
     .run(status, nowIso(), campaignId, userId, expected);
-  if (changesOf(result) === 0) throw new UserError("That campaign cannot be updated.");
+  if (changed === 0) throw new UserError("That campaign cannot be updated.");
 }
 
-export function campaignStats(campaignId: string): CampaignStats {
-  const row = getDb()
+export async function campaignStats(campaignId: string): Promise<CampaignStats> {
+  const sql = await readySql();
+  const row = (await sql
     .prepare(
       `SELECT
          COUNT(*) AS total,
@@ -822,10 +828,10 @@ export function campaignStats(campaignId: string): CampaignStats {
          SUM(click_count) AS clicks
        FROM recipients WHERE campaign_id = ?`,
     )
-    .get(campaignId) as Record<string, number | null>;
-  const unsubs = getDb()
+    .get(campaignId)) as Record<string, number | string | null>;
+  const unsubs = (await sql
     .prepare("SELECT COUNT(*) AS n FROM events WHERE campaign_id = ? AND type = 'unsubscribe'")
-    .get(campaignId) as { n: number };
+    .get(campaignId)) as CountRow;
   return {
     total: Number(row.total ?? 0),
     sent: Number(row.sent ?? 0),
@@ -840,43 +846,45 @@ export function campaignStats(campaignId: string): CampaignStats {
   };
 }
 
-export function clickStats(campaignId: string): ClickStat[] {
-  return getDb()
+export async function clickStats(campaignId: string): Promise<ClickStat[]> {
+  const sql = await readySql();
+  const rows = await sql
     .prepare(
       `SELECT url, COUNT(*) AS hits FROM events WHERE campaign_id = ? AND type = 'click' AND url != ''
        GROUP BY url ORDER BY hits DESC LIMIT 20`,
     )
-    .all(campaignId)
-    .map((row) => {
-      const item = row as { url: string; hits: number };
-      return { url: item.url, hits: Number(item.hits) };
-    });
+    .all(campaignId);
+  return rows.map((row) => {
+    const item = row as { url: string; hits: number | string };
+    return { url: item.url, hits: Number(item.hits) };
+  });
 }
 
-export function failureRows(campaignId: string): FailureRow[] {
-  return getDb()
-    .prepare(
-      "SELECT email, error FROM recipients WHERE campaign_id = ? AND status = 'failed' ORDER BY email LIMIT 50",
-    )
-    .all(campaignId) as FailureRow[];
+export async function failureRows(campaignId: string): Promise<FailureRow[]> {
+  const sql = await readySql();
+  return (await sql
+    .prepare("SELECT email, error FROM recipients WHERE campaign_id = ? AND status = 'failed' ORDER BY email LIMIT 50")
+    .all(campaignId)) as FailureRow[];
 }
 
-export function recentDeliveries(campaignId: string): { id: string; email: string; createdAt: string }[] {
-  return getDb()
+export async function recentDeliveries(campaignId: string): Promise<{ id: string; email: string; createdAt: string }[]> {
+  const sql = await readySql();
+  const rows = await sql
     .prepare(
       `SELECT d.id, d.to_email AS email, d.created_at
        FROM deliveries d JOIN recipients r ON r.id = d.recipient_id
        WHERE r.campaign_id = ? ORDER BY d.created_at DESC LIMIT 20`,
     )
-    .all(campaignId)
-    .map((row) => {
-      const item = row as { id: string; email: string; created_at: string };
-      return { id: item.id, email: item.email, createdAt: item.created_at };
-    });
+    .all(campaignId);
+  return rows.map((row) => {
+    const item = row as { id: string; email: string; created_at: string };
+    return { id: item.id, email: item.email, createdAt: item.created_at };
+  });
 }
 
-export function getDelivery(userId: string, deliveryId: string): DeliveryView | null {
-  const row = getDb()
+export async function getDelivery(userId: string, deliveryId: string): Promise<DeliveryView | null> {
+  const sql = await readySql();
+  const row = (await sql
     .prepare(
       `SELECT d.id, d.recipient_id, d.to_email, d.subject, d.html, d.mode, d.created_at, r.token, r.status
        FROM deliveries d
@@ -884,19 +892,17 @@ export function getDelivery(userId: string, deliveryId: string): DeliveryView | 
        JOIN campaigns c ON c.id = r.campaign_id
        WHERE d.id = ? AND c.user_id = ?`,
     )
-    .get(deliveryId, userId) as
-    | {
-        id: string;
-        recipient_id: string;
-        to_email: string;
-        subject: string;
-        html: string;
-        mode: string;
-        created_at: string;
-        token: string;
-        status: string;
-      }
-    | undefined;
+    .get(deliveryId, userId)) as {
+    id: string;
+    recipient_id: string;
+    to_email: string;
+    subject: string;
+    html: string;
+    mode: string;
+    created_at: string;
+    token: string;
+    status: string;
+  } | null;
   if (!row) return null;
   return {
     id: row.id,
@@ -911,9 +917,10 @@ export function getDelivery(userId: string, deliveryId: string): DeliveryView | 
   };
 }
 
-export function releaseStaleClaims(): void {
+export async function releaseStaleClaims(): Promise<void> {
   const cutoff = new Date(Date.now() - 10 * 60 * 1000).toISOString();
-  getDb()
+  const sql = await readySql();
+  await sql
     .prepare(
       `UPDATE recipients SET status = 'pending', claimed_at = NULL
        WHERE status = 'sending' AND claimed_at IS NOT NULL AND claimed_at < ?`,
@@ -921,34 +928,28 @@ export function releaseStaleClaims(): void {
     .run(cutoff);
 }
 
-export function claimBatch(limit: number): SendJob[] {
-  const db = getDb();
-  const claimed: string[] = [];
-  db.exec("BEGIN IMMEDIATE");
-  try {
-    const ids = db
+export async function claimBatch(limit: number): Promise<SendJob[]> {
+  const sql = await readySql();
+  const claimed = await sql.transaction(async (tx) => {
+    const ids = (await tx
       .prepare(
         `SELECT r.id FROM recipients r
          JOIN campaigns c ON c.id = r.campaign_id
          WHERE r.status = 'pending' AND c.status = 'sending'
          ORDER BY r.created_at LIMIT ?`,
       )
-      .all(limit) as { id: string }[];
-    const claim = db.prepare(
-      "UPDATE recipients SET status = 'sending', claimed_at = ? WHERE id = ? AND status = 'pending'",
-    );
+      .all(limit)) as { id: string }[];
+    const claim = tx.prepare("UPDATE recipients SET status = 'sending', claimed_at = ? WHERE id = ? AND status = 'pending'");
     const now = nowIso();
+    const won: string[] = [];
     for (const row of ids) {
-      if (changesOf(claim.run(now, row.id)) === 1) claimed.push(row.id);
+      if ((await claim.run(now, row.id)) === 1) won.push(row.id);
     }
-    db.exec("COMMIT");
-  } catch (error) {
-    db.exec("ROLLBACK");
-    throw error;
-  }
+    return won;
+  });
   if (claimed.length === 0) return [];
   const placeholders = claimed.map(() => "?").join(", ");
-  return db
+  const rows = await sql
     .prepare(
       `SELECT r.id AS recipient_id, r.campaign_id, r.contact_id, contacts.status AS contact_status, r.email,
               r.first_name, r.last_name, r.unsub_token, r.token, c.subject, c.html, c.from_name, c.from_email,
@@ -958,55 +959,63 @@ export function claimBatch(limit: number): SendJob[] {
        LEFT JOIN contacts ON contacts.id = r.contact_id
        WHERE r.id IN (${placeholders})`,
     )
-    .all(...claimed)
-    .map((row) => {
-      const item = row as Record<string, string | null>;
-      return {
-        recipientId: String(item.recipient_id),
-        campaignId: String(item.campaign_id),
-        contactId: item.contact_id,
-        contactStatus: item.contact_status,
-        email: String(item.email),
-        firstName: String(item.first_name ?? ""),
-        lastName: String(item.last_name ?? ""),
-        unsubToken: String(item.unsub_token),
-        token: String(item.token),
-        subject: String(item.subject),
-        html: String(item.html),
-        fromName: String(item.from_name ?? ""),
-        fromEmail: String(item.from_email ?? ""),
-        replyTo: String(item.reply_to ?? ""),
-        origin: String(item.origin ?? ""),
-        userId: String(item.user_id),
-        campaignStatus: String(item.campaign_status),
-      };
-    });
+    .all(...claimed);
+  return rows.map((row) => {
+    const item = row as Record<string, string | null>;
+    return {
+      recipientId: String(item.recipient_id),
+      campaignId: String(item.campaign_id),
+      contactId: item.contact_id,
+      contactStatus: item.contact_status,
+      email: String(item.email),
+      firstName: String(item.first_name ?? ""),
+      lastName: String(item.last_name ?? ""),
+      unsubToken: String(item.unsub_token),
+      token: String(item.token),
+      subject: String(item.subject),
+      html: String(item.html),
+      fromName: String(item.from_name ?? ""),
+      fromEmail: String(item.from_email ?? ""),
+      replyTo: String(item.reply_to ?? ""),
+      origin: String(item.origin ?? ""),
+      userId: String(item.user_id),
+      campaignStatus: String(item.campaign_status),
+    };
+  });
 }
 
-export function markRecipient(id: string, status: "sent" | "failed" | "skipped" | "pending", error: string): void {
+export async function markRecipient(id: string, status: "sent" | "failed" | "skipped" | "pending", error: string): Promise<void> {
   const sentAt = status === "sent" ? nowIso() : null;
-  getDb()
+  const sql = await readySql();
+  await sql
     .prepare("UPDATE recipients SET status = ?, error = ?, sent_at = ?, claimed_at = NULL WHERE id = ?")
     .run(status, error.slice(0, 500), sentAt, id);
 }
 
-export function saveDelivery(input: {
+export async function saveDelivery(input: {
   recipientId: string;
   mode: "smtp" | "capture";
   to: string;
   subject: string;
   html: string;
-}): void {
-  getDb()
+}): Promise<void> {
+  const sql = await readySql();
+  // Same effect as SQLite's INSERT OR REPLACE: one delivery per recipient, replaced on resend.
+  await sql
     .prepare(
-      `INSERT OR REPLACE INTO deliveries (id, recipient_id, mode, to_email, subject, html, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO deliveries (id, recipient_id, mode, to_email, subject, html, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT (recipient_id) DO UPDATE SET
+         id = excluded.id, mode = excluded.mode, to_email = excluded.to_email,
+         subject = excluded.subject, html = excluded.html, created_at = excluded.created_at`,
     )
     .run(newId(), input.recipientId, input.mode, input.to, input.subject, input.html, nowIso());
 }
 
-export function finishCampaigns(): void {
-  getDb()
+export async function finishCampaigns(): Promise<void> {
+  const now = nowIso();
+  const sql = await readySql();
+  await sql
     .prepare(
       `UPDATE campaigns SET status = 'sent', finished_at = ?, updated_at = ?
        WHERE status = 'sending'
@@ -1014,33 +1023,35 @@ export function finishCampaigns(): void {
          SELECT 1 FROM recipients r WHERE r.campaign_id = campaigns.id AND r.status IN ('pending', 'sending')
        )`,
     )
-    .run(nowIso(), nowIso());
+    .run(now, now);
 }
 
-export function recordOpen(token: string): void {
-  const row = getDb().prepare("SELECT id, campaign_id FROM recipients WHERE token = ?").get(token) as
+export async function recordOpen(token: string): Promise<void> {
+  const sql = await readySql();
+  const row = (await sql.prepare("SELECT id, campaign_id FROM recipients WHERE token = ?").get(token)) as
     | { id: string; campaign_id: string }
-    | undefined;
+    | null;
   if (!row) return;
   const now = nowIso();
-  getDb()
+  await sql
     .prepare("UPDATE recipients SET open_count = open_count + 1, opened_at = COALESCE(opened_at, ?) WHERE id = ?")
     .run(now, row.id);
-  getDb()
+  await sql
     .prepare("INSERT INTO events (id, campaign_id, recipient_id, type, url, created_at) VALUES (?, ?, ?, 'open', '', ?)")
     .run(newId(), row.campaign_id, row.id, now);
 }
 
-export function recordClick(token: string, url: string): void {
-  const row = getDb().prepare("SELECT id, campaign_id FROM recipients WHERE token = ?").get(token) as
+export async function recordClick(token: string, url: string): Promise<void> {
+  const sql = await readySql();
+  const row = (await sql.prepare("SELECT id, campaign_id FROM recipients WHERE token = ?").get(token)) as
     | { id: string; campaign_id: string }
-    | undefined;
+    | null;
   if (!row) return;
   const now = nowIso();
-  getDb()
+  await sql
     .prepare("UPDATE recipients SET click_count = click_count + 1, clicked_at = COALESCE(clicked_at, ?) WHERE id = ?")
     .run(now, row.id);
-  getDb()
+  await sql
     .prepare("INSERT INTO events (id, campaign_id, recipient_id, type, url, created_at) VALUES (?, ?, ?, 'click', ?, ?)")
     .run(newId(), row.campaign_id, row.id, url.slice(0, 2000), now);
 }
@@ -1051,44 +1062,43 @@ export type UnsubView = {
   status: string;
 };
 
-export function unsubView(token: string): UnsubView | null {
-  const contact = getDb()
+export async function unsubView(token: string): Promise<UnsubView | null> {
+  const sql = await readySql();
+  const contact = (await sql
     .prepare(
       `SELECT c.email, c.status, u.company_name
        FROM contacts c JOIN users u ON u.id = c.user_id WHERE c.unsub_token = ?`,
     )
-    .get(token) as { email: string; status: string; company_name: string } | undefined;
+    .get(token)) as { email: string; status: string; company_name: string } | null;
   if (contact) {
     return { email: contact.email, companyName: contact.company_name, status: contact.status };
   }
-  const suppressed = getDb()
-    .prepare(
-      `SELECT s.email, u.company_name FROM suppressions s JOIN users u ON u.id = s.user_id WHERE s.token = ?`,
-    )
-    .get(token) as { email: string; company_name: string } | undefined;
+  const suppressed = (await sql
+    .prepare(`SELECT s.email, u.company_name FROM suppressions s JOIN users u ON u.id = s.user_id WHERE s.token = ?`)
+    .get(token)) as { email: string; company_name: string } | null;
   if (!suppressed) return null;
   return { email: suppressed.email, companyName: suppressed.company_name, status: "unsubscribed" };
 }
 
-export function unsubscribe(token: string, campaignId: string | null): UnsubView | null {
-  const current = unsubView(token);
+export async function unsubscribe(token: string, campaignId: string | null): Promise<UnsubView | null> {
+  const current = await unsubView(token);
   if (!current) return null;
-  const db = getDb();
-  const result = db
+  const sql = await readySql();
+  const changed = await sql
     .prepare("UPDATE contacts SET status = 'unsubscribed' WHERE unsub_token = ? AND status != 'unsubscribed'")
     .run(token);
-  if (changesOf(result) > 0 && campaignId) {
-    const recipient = db
+  if (changed > 0 && campaignId) {
+    const recipient = (await sql
       .prepare(
         `SELECT r.id FROM recipients r
          JOIN contacts c ON c.id = r.contact_id
          WHERE c.unsub_token = ? AND r.campaign_id = ?`,
       )
-      .get(token, campaignId) as { id: string } | undefined;
+      .get(token, campaignId)) as { id: string } | null;
     if (recipient) {
-      db.prepare(
-        "INSERT INTO events (id, campaign_id, recipient_id, type, url, created_at) VALUES (?, ?, ?, 'unsubscribe', '', ?)",
-      ).run(newId(), campaignId, recipient.id, nowIso());
+      await sql
+        .prepare("INSERT INTO events (id, campaign_id, recipient_id, type, url, created_at) VALUES (?, ?, ?, 'unsubscribe', '', ?)")
+        .run(newId(), campaignId, recipient.id, nowIso());
     }
   }
   return { ...current, status: "unsubscribed" };

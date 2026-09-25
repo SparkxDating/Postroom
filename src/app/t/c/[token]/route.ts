@@ -8,6 +8,6 @@ export async function GET(request: Request, context: { params: Promise<{ token: 
   const url = new URL(request.url);
   const target = readClickTarget(token, url.searchParams.get("u") ?? "", url.searchParams.get("s") ?? "");
   if (!target) return new Response("This link is not valid.", { status: 400 });
-  recordClick(token, target);
+  await recordClick(token, target);
   return Response.redirect(target, 302);
 }

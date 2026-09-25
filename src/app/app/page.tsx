@@ -9,8 +9,8 @@ export const metadata: Metadata = { title: "Overview" };
 
 export default async function OverviewPage() {
   const user = await requireUser();
-  const stats = dashboard(user.id);
-  const recent = recentCampaigns(user.id);
+  const stats = await dashboard(user.id);
+  const recent = await recentCampaigns(user.id);
   return (
     <div>
       <div className="page-header">
