@@ -8,7 +8,7 @@ export const runtime = "nodejs";
 export async function GET(request: Request) {
   const jar = await cookies();
   const id = jar.get(SESSION_COOKIE)?.value;
-  if (id) deleteSession(id);
+  if (id) await deleteSession(id);
   jar.delete(SESSION_COOKIE);
   return NextResponse.redirect(new URL("/login", request.url));
 }

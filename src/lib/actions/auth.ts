@@ -24,12 +24,12 @@ function tooMany(email: string): boolean {
 export async function signupAction(formData: FormData): Promise<void> {
   const next = safeNext(String(formData.get("next") || "/app"));
   try {
-    const user = createUser({
+    const user = await createUser({
       name: String(formData.get("name") || ""),
       email: String(formData.get("email") || ""),
       password: String(formData.get("password") || ""),
     });
-    await setSessionCookie(createSession(user.id));
+    await setSessionCookie(await createSession(user.id));
   } catch (error) {
     if (error instanceof UserError) redirect(withMessage("/signup", "error", error.message));
     throw error;
@@ -43,17 +43,17 @@ export async function loginAction(formData: FormData): Promise<void> {
   if (tooMany(email)) {
     redirect(withMessage("/login", "error", "Too many sign-in attempts. Wait a few minutes and try again."));
   }
-  const user = verifyPassword(email, String(formData.get("password") || ""));
+  const user = await verifyPassword(email, String(formData.get("password") || ""));
   if (!user) redirect(withMessage(`/login?next=${encodeURIComponent(next)}`, "error", "Email or password is wrong."));
   attempts.delete(normalizeEmail(email));
-  await setSessionCookie(createSession(user.id));
+  await setSessionCookie(await createSession(user.id));
   redirect(next);
 }
 
 export async function logoutAction(): Promise<void> {
   const jar = await cookies();
   const id = jar.get(SESSION_COOKIE)?.value;
-  if (id) deleteSession(id);
+  if (id) await deleteSession(id);
   jar.delete(SESSION_COOKIE);
   redirect("/");
 }
@@ -63,8 +63,8 @@ export async function deleteAccountAction(): Promise<void> {
   const user = await requireUser();
   const jar = await cookies();
   const id = jar.get(SESSION_COOKIE)?.value;
-  deleteAccount(user.id);
-  if (id) deleteSession(id);
+  await deleteAccount(user.id);
+  if (id) await deleteSession(id);
   jar.delete(SESSION_COOKIE);
   redirect("/");
 }

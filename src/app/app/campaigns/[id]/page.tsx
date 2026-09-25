@@ -34,13 +34,13 @@ export default async function CampaignPage({
   const user = await requireUser();
   const { id } = await params;
   const query = await searchParams;
-  const campaign = getCampaign(user.id, id);
+  const campaign = await getCampaign(user.id, id);
   if (!campaign) notFound();
-  const lists = listLists(user.id);
-  const stats = campaign.status === "draft" ? null : campaignStats(campaign.id);
-  const clicks = stats ? clickStats(campaign.id) : [];
-  const failures = stats ? failureRows(campaign.id) : [];
-  const deliveries = stats ? recentDeliveries(campaign.id) : [];
+  const lists = await listLists(user.id);
+  const stats = campaign.status === "draft" ? null : await campaignStats(campaign.id);
+  const clicks = stats ? await clickStats(campaign.id) : [];
+  const failures = stats ? await failureRows(campaign.id) : [];
+  const deliveries = stats ? await recentDeliveries(campaign.id) : [];
   return (
     <div className="stack">
       <RefreshWhileSending active={campaign.status === "sending"} />

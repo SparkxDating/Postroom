@@ -13,7 +13,7 @@ export default async function NewCampaignPage({
 }) {
   const user = await requireUser();
   const params = await searchParams;
-  const lists = listLists(user.id);
+  const lists = await listLists(user.id);
   return (
     <div className="stack">
       <PageHeader title="New campaign" lede="Name it and pick a list. You will write the letter on the next screen." />

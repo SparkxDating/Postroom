@@ -14,7 +14,7 @@ export default async function ContactsPage({
 }) {
   const user = await requireUser();
   const query = await searchParams;
-  const contacts = listContacts(user.id, Number(query.page || 1), query.q || "");
+  const contacts = await listContacts(user.id, Number(query.page || 1), query.q || "");
   return (
     <div className="stack">
       <PageHeader

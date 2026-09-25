@@ -11,7 +11,7 @@ export async function addContactAction(formData: FormData): Promise<void> {
   const listId = String(formData.get("listId") || "") || null;
   const back = listId ? `/app/lists/${listId}` : "/app/contacts";
   try {
-    const result = addContact(user.id, {
+    const result = await addContact(user.id, {
       email: String(formData.get("email") || ""),
       firstName: String(formData.get("firstName") || ""),
       lastName: String(formData.get("lastName") || ""),
@@ -34,7 +34,7 @@ export async function setStatusAction(formData: FormData): Promise<void> {
   const status = formData.get("status") === "subscribed" ? "subscribed" : "unsubscribed";
   const back = String(formData.get("back") || "/app/contacts");
   try {
-    setContactStatus(user.id, String(formData.get("id") || ""), status);
+    await setContactStatus(user.id, String(formData.get("id") || ""), status);
   } catch (error) {
     if (error instanceof UserError) redirect(withMessage(back, "error", error.message));
     throw error;
@@ -46,7 +46,7 @@ export async function deleteContactAction(formData: FormData): Promise<void> {
   const user = await requireUser();
   const back = String(formData.get("back") || "/app/contacts");
   try {
-    deleteContact(user.id, String(formData.get("id") || ""));
+    await deleteContact(user.id, String(formData.get("id") || ""));
   } catch (error) {
     if (error instanceof UserError) redirect(withMessage("/app/contacts", "error", error.message));
     throw error;

@@ -9,7 +9,7 @@ import { withMessage } from "../validators";
 export async function createListAction(formData: FormData): Promise<void> {
   const user = await requireUser();
   try {
-    const id = createList(user.id, String(formData.get("name") || ""));
+    const id = await createList(user.id, String(formData.get("name") || ""));
     redirect(`/app/lists/${id}`);
   } catch (error) {
     if (error instanceof UserError) redirect(withMessage("/app/lists", "error", error.message));
@@ -21,7 +21,7 @@ export async function renameListAction(formData: FormData): Promise<void> {
   const user = await requireUser();
   const id = String(formData.get("id") || "");
   try {
-    renameList(user.id, id, String(formData.get("name") || ""));
+    await renameList(user.id, id, String(formData.get("name") || ""));
   } catch (error) {
     if (error instanceof UserError) redirect(withMessage(`/app/lists/${id}`, "error", error.message));
     throw error;
@@ -31,14 +31,14 @@ export async function renameListAction(formData: FormData): Promise<void> {
 
 export async function deleteListAction(formData: FormData): Promise<void> {
   const user = await requireUser();
-  deleteList(user.id, String(formData.get("id") || ""));
+  await deleteList(user.id, String(formData.get("id") || ""));
   redirect(withMessage("/app/lists", "notice", "List deleted. Contacts were kept."));
 }
 
 export async function removeMemberAction(formData: FormData): Promise<void> {
   const user = await requireUser();
   const listId = String(formData.get("listId") || "");
-  removeFromList(user.id, listId, String(formData.get("contactId") || ""));
+  await removeFromList(user.id, listId, String(formData.get("contactId") || ""));
   redirect(withMessage(`/app/lists/${listId}`, "notice", "Removed from this list."));
 }
 
@@ -52,7 +52,7 @@ export async function importCsvAction(formData: FormData): Promise<void> {
   }
   if (file.size > 2_000_000) redirect(withMessage(back, "error", "CSV files must be under 2 MB."));
   try {
-    const result = importContacts(user.id, listId, await file.text());
+    const result = await importContacts(user.id, listId, await file.text());
     const parts = [
       `${result.created} new`,
       `${result.updated} updated`,

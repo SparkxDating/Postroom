@@ -14,7 +14,7 @@ export default async function OutboxPage({
 }) {
   const user = await requireUser();
   const { id, deliveryId } = await params;
-  const delivery = getDelivery(user.id, deliveryId);
+  const delivery = await getDelivery(user.id, deliveryId);
   if (!delivery) notFound();
   return (
     <div className="stack">

@@ -14,7 +14,7 @@ export default async function TemplatesPage({
 }) {
   const user = await requireUser();
   const params = await searchParams;
-  const templates = listTemplates(user.id);
+  const templates = await listTemplates(user.id);
   return (
     <div>
       <PageHeader

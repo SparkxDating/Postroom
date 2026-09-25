@@ -18,7 +18,7 @@ export default async function EditTemplatePage({
   const user = await requireUser();
   const { id } = await params;
   const query = await searchParams;
-  const template = getTemplate(user.id, id);
+  const template = await getTemplate(user.id, id);
   if (!template) notFound();
   return (
     <div className="stack">

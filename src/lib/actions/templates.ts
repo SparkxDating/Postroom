@@ -10,7 +10,7 @@ export async function saveTemplateAction(formData: FormData): Promise<void> {
   const user = await requireUser();
   const id = String(formData.get("id") || "") || undefined;
   try {
-    const saved = saveTemplate(user.id, {
+    const saved = await saveTemplate(user.id, {
       id,
       name: String(formData.get("name") || ""),
       subject: String(formData.get("subject") || ""),
@@ -27,15 +27,15 @@ export async function saveTemplateAction(formData: FormData): Promise<void> {
 
 export async function deleteTemplateAction(formData: FormData): Promise<void> {
   const user = await requireUser();
-  deleteTemplate(user.id, String(formData.get("id") || ""));
+  await deleteTemplate(user.id, String(formData.get("id") || ""));
   redirect(withMessage("/app/templates", "notice", "Template deleted."));
 }
 
 export async function campaignFromTemplateAction(formData: FormData): Promise<void> {
   const user = await requireUser();
-  const template = getTemplate(user.id, String(formData.get("id") || ""));
+  const template = await getTemplate(user.id, String(formData.get("id") || ""));
   if (!template) redirect(withMessage("/app/templates", "error", "Template not found."));
-  const id = saveCampaign(user.id, {
+  const id = await saveCampaign(user.id, {
     name: template.name,
     subject: template.subject,
     html: template.html,

@@ -15,7 +15,7 @@ export default async function ListsPage({
 }) {
   const user = await requireUser();
   const params = await searchParams;
-  const lists = listLists(user.id);
+  const lists = await listLists(user.id);
   return (
     <div>
       <PageHeader title="Lists" lede="A list is who can receive a campaign. People can be on more than one." />

@@ -19,15 +19,15 @@ function sleep(ms: number): Promise<void> {
 }
 
 async function processJob(job: SendJob): Promise<void> {
-  if (!campaignIsSending(job.campaignId)) {
-    markRecipient(job.recipientId, "pending", "");
+  if (!(await campaignIsSending(job.campaignId))) {
+    await markRecipient(job.recipientId, "pending", "");
     return;
   }
   if (job.contactStatus !== "subscribed") {
-    markRecipient(job.recipientId, "skipped", job.contactStatus === "unsubscribed" ? "Unsubscribed" : "Contact removed");
+    await markRecipient(job.recipientId, "skipped", job.contactStatus === "unsubscribed" ? "Unsubscribed" : "Contact removed");
     return;
   }
-  const account = getAccount(job.userId);
+  const account = await getAccount(job.userId);
   const origin = job.origin || "http://localhost:3010";
   const unsubscribeUrl = `${origin}/u/${job.unsubToken}?c=${job.campaignId}`;
   const composed = composeEmail({
@@ -50,7 +50,7 @@ async function processJob(job: SendJob): Promise<void> {
   });
   try {
     if (!account.smtpConfigured) {
-      saveDelivery({
+      await saveDelivery({
         recipientId: job.recipientId,
         mode: "capture",
         to: job.email,
@@ -58,7 +58,7 @@ async function processJob(job: SendJob): Promise<void> {
         html: composed.html,
       });
     } else {
-      const smtp = smtpCredentials(job.userId);
+      const smtp = await smtpCredentials(job.userId);
       await deliverMessage({
         smtp,
         from: formatAddress(job.fromName, job.fromEmail),
@@ -69,7 +69,7 @@ async function processJob(job: SendJob): Promise<void> {
         text: composed.text,
         unsubscribeUrl,
       });
-      saveDelivery({
+      await saveDelivery({
         recipientId: job.recipientId,
         mode: "smtp",
         to: job.email,
@@ -77,25 +77,25 @@ async function processJob(job: SendJob): Promise<void> {
         html: composed.html,
       });
     }
-    markRecipient(job.recipientId, "sent", "");
+    await markRecipient(job.recipientId, "sent", "");
     if (process.env.POSTROOM_WORKER) {
       console.log(`${account.smtpConfigured ? "smtp" : "capture"} ${job.email}`);
     }
   } catch (error) {
     const message = error instanceof UserError || error instanceof Error ? error.message : "Send failed";
-    markRecipient(job.recipientId, "failed", message);
+    await markRecipient(job.recipientId, "failed", message);
     if (process.env.POSTROOM_WORKER) console.log(`failed ${job.email}: ${message}`);
   }
 }
 
 export async function runBatch(limit = 5): Promise<number> {
-  releaseStaleClaims();
-  const jobs = claimBatch(limit);
+  await releaseStaleClaims();
+  const jobs = await claimBatch(limit);
   const delay = Number(process.env.SEND_DELAY_MS || 250);
   for (const job of jobs) {
     await processJob(job);
     if (delay > 0) await sleep(delay);
   }
-  finishCampaigns();
+  await finishCampaigns();
   return jobs.length;
 }

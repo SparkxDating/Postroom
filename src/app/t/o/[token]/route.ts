@@ -6,7 +6,7 @@ const GIF = Buffer.from("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA
 
 export async function GET(_request: Request, context: { params: Promise<{ token: string }> }) {
   const { token } = await context.params;
-  recordOpen(token);
+  await recordOpen(token);
   return new Response(GIF, {
     headers: {
       "Content-Type": "image/gif",

@@ -18,10 +18,10 @@ export default async function ListDetailPage({
   const user = await requireUser();
   const { id } = await params;
   const query = await searchParams;
-  const list = getList(user.id, id);
+  const list = await getList(user.id, id);
   if (!list) notFound();
   const page = Number(query.page || 1);
-  const members = listMembers(user.id, id, page, query.q || "");
+  const members = await listMembers(user.id, id, page, query.q || "");
   if (!members) notFound();
   return (
     <div className="stack">

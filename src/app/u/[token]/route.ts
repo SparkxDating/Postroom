@@ -25,7 +25,7 @@ function html(body: string, status: number): Response {
 
 export async function GET(request: Request, context: { params: Promise<{ token: string }> }) {
   const { token } = await context.params;
-  const view = unsubView(token);
+  const view = await unsubView(token);
   if (!view) return html(page({ title: "Link not valid", body: "<p>This unsubscribe link is not valid.</p>" }), 404);
   const campaign = new URL(request.url).searchParams.get("c");
   if (view.status === "unsubscribed") {
@@ -51,7 +51,7 @@ export async function GET(request: Request, context: { params: Promise<{ token: 
 export async function POST(request: Request, context: { params: Promise<{ token: string }> }) {
   const { token } = await context.params;
   const campaign = new URL(request.url).searchParams.get("c");
-  const view = unsubscribe(token, campaign);
+  const view = await unsubscribe(token, campaign);
   if (!view) return html(page({ title: "Link not valid", body: "<p>This unsubscribe link is not valid.</p>" }), 404);
   return html(
     page({
