@@ -45,16 +45,42 @@ The from address can differ from the SMTP username. Many providers, including SE
 
 Copy `.env.example` to `.env.local` if you want to set these. Local use works without them.
 
+- `DATABASE_URL` — Postgres connection string. Set it in production. Leave it unset locally and Postgres is skipped in favour of a SQLite file at `data/postroom.db` (override the path with `POSTROOM_DB`). Tables are created on first use in both cases.
+- `DATABASE_SSL` — optional TLS override for Postgres: `disable`, `require`, `prefer`, `allow` or `verify-full`. By default Postgres uses the `sslmode` in `DATABASE_URL` if there is one. Otherwise TLS is off for `localhost` and required for every other host.
 - `APP_ORIGIN` — public URL written into tracking and unsubscribe links. Leave unset locally and Postroom uses the request host.
-- `APP_SECRET` — encrypts SMTP passwords and signs click links. If unset, a secret is created in `data/app.secret`.
+- `APP_SECRET` — encrypts SMTP passwords and signs click links. If unset, a secret is created in `data/app.secret`. Required on Vercel and any other host without a persistent disk.
 - `SEND_DELAY_MS` — pause between messages. Default 250.
 
-The database file is `data/postroom.db`.
+## Database
+
+Postroom stores everything in Postgres when `DATABASE_URL` is set. Without it, a local SQLite file is used, which needs Node 22.5 or newer. Serverless hosts such as Vercel have no persistent disk, so the SQLite file is lost there. Use Postgres for any deployed copy.
+
+A hosted Postgres works well:
+
+- **Neon via the Vercel Marketplace**: in the Vercel project, open Storage (or Integrations), add Neon, and connect it to the project. `DATABASE_URL` is added to the environment for you. The pooled connection string (host containing `-pooler`) is recommended.
+- **Supabase**: create a project, open Connect, and copy a connection string. On Vercel use the transaction pooler (port 6543). Add it as `DATABASE_URL`.
+- Any other Postgres 13+ works too.
+
+To use Postgres locally, point `DATABASE_URL` at it, for example `postgres://postroom:postroom@localhost:5432/postroom`. TLS is off for localhost unless you set `DATABASE_SSL` or `sslmode`.
+
+### Deploying on Vercel
+
+1. Create the database as described above so that `DATABASE_URL` is set for Production (and Preview if you use it).
+2. Set `APP_SECRET` to a long random string, and `APP_ORIGIN` to the public URL.
+3. Redeploy. The tables are created on the first request.
+
+Vercel does not run the background send worker. Run `npm run worker` on a machine that stays on, with the same `DATABASE_URL` and `APP_SECRET`, so that queued campaigns get sent.
 
 ## Tests
 
 ```bash
 npm test
+```
+
+This uses a temporary SQLite file. To run the same tests against Postgres, set `DATABASE_URL`. Each run creates its own account and deletes it at the end:
+
+```bash
+DATABASE_URL=postgres://postroom:postroom@localhost:5432/postroom_test npm test
 ```
 
 ## Your responsibility
