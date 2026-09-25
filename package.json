@@ -2,6 +2,9 @@
   "name": "postroom",
   "version": "0.1.0",
   "private": true,
+  "engines": {
+    "node": "22.x"
+  },
   "scripts": {
     "dev": "concurrently -n web,worker \"next dev -p 3010\" \"tsx scripts/worker.ts\"",
     "worker": "tsx scripts/worker.ts",
